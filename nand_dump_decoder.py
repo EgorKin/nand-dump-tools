@@ -151,6 +151,405 @@ def read_atmel_config(page, config):
     return config
 
 
+#my additions
+def winbond_error_correction(infiles, outfile, config):
+    """Do some error correction"""
+
+    # ECC1 for blank sector (FF only)
+    nullbyte_ecc1 = [0x0A, 0x3A, 0xE9, 0x39, 0x43, 0xDE, 0x09, 0xAC, 0x83, 0x22, 0xD0, 0xE1, 0x7F, 0xF3]
+
+    # ECC2 for blank sector (FF only)
+    nullbyte_ecc2 = [0x79, 0xE8, 0x94, 0x34, 0xA2, 0xD6, 0xB8, 0x41, 0x11, 0x95, 0x93, 0x4B, 0x6B, 0x5B]
+
+    # initialize BCH decoder
+    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'], False)
+
+    # open output file
+    fout = open(outfile, "wb")
+
+    # adjust data size depending on configured file offset
+    data_size = config['filesize'] - config['file_offset']
+
+    # initialize some variables
+    processed_sector_count = 0
+    corrected_sector_count = 0
+    uncorrected_sector_count = 0
+    good_sector_count = 0
+    bad_sector_count = 0
+    blank_page_count = 0
+    bad_block_count = 0
+    sectors_per_page = config['sectors_per_page'] # по 2 сектора на странице у нас в дампе
+    total_page_count = data_size // config['fullpagesize']
+    total_sectors = total_page_count * sectors_per_page
+    page_size = config['pagesize']
+    block_size_bytes = config['fullpagesize'] * config['blocksize'] # размер одного блока памяти (2 112 байт * 64 = 135 168 байт)
+    total_blocks = data_size // block_size_bytes
+    
+    #config['blocksize'] - балбесы! это оказывается = 64 - кол-во страниц в блоке
+
+    block_offset = config['file_offset'] // block_size_bytes
+
+    # blank page data
+    blank_page = b'\xff' * config['fullpagesize'] # полностью пустая страница вся в FF т.к. у нее нет OOB данных
+
+    # work with input files
+    input_file_handles = []
+    input_file_index = 0
+    for f in infiles:
+        input_file_handles.append(open(f, "r+b"))
+
+    # memory-map the input files
+    input_file_mmaps = []
+    for fin in input_file_handles:
+        input_file_mmaps.append(mmap.mmap(fin.fileno(), 0))
+
+    # set current input file memory-map
+    mm = input_file_mmaps[input_file_index]
+
+    # with open(infile, "rb") as fin:
+    print("[*] Starting error correcting process ...")
+
+    for block in range(total_blocks): # берем каждый блок - от 0 да 1023 включительно
+        # read current block data
+        start_block = (block + block_offset) * block_size_bytes
+        end_block = start_block + block_size_bytes
+        block_data = mm[start_block:end_block]
+
+        # check if page has Bad Block marker != FF FF
+        b1 = block_data[0x800:0x802]
+        if b1 != b'\xff\xff':
+            # increment bad block counter
+            bad_block_count += 1
+            continue
+
+        # process pages in block
+        for page in range(config['blocksize']): # берем каждую страницу взятого блока - от 0 да 63 включительно
+            start_page = page * config['fullpagesize']
+            end_page = start_page + config['fullpagesize']
+            page_data = block_data[start_page:end_page]
+
+            # check if page is blank (FF FF FF ...)
+            if page_data == blank_page:
+                # increment blank page counter
+                blank_page_count += 1
+
+                # increment good sector counter
+                good_sector_count += sectors_per_page
+
+                # increment count of processed sectors
+                processed_sector_count += sectors_per_page
+
+                # write blank page to output file
+                fout.write(blank_page[:page_size]) # запишем 2048 байт 0xFF раз у нас страница пустая
+
+                # show some statistics during processing all sectors
+                ##progress = processed_sector_count / total_sectors * 100
+                ##print("\r    Progress: {:.2f}% ({}/{} sectors)".format(progress, processed_sector_count, total_sectors), end="")
+                if (page+1)%64 == 0:
+                    print("\033[90m█\033[0m") # blank page symbol
+                else:
+                    print("\033[90m█\033[0m", end='')
+                continue
+
+            # if page not blank start processing sectors in page
+            my_page_mark = 0 # no errors at this sector
+            
+            
+            # process sector 0 (can be different than remaining sectors
+            # of the current page)
+            sector = 0
+            bad_sector = False
+
+            # increment count of processed sectors
+            processed_sector_count += 1
+
+            # use all input files, if required (early exit condition)
+            for mmin in input_file_mmaps:
+                # read page of current memory-map
+                start_page = start_block + page * config['fullpagesize']
+                end_page = start_page + config['fullpagesize']
+                page_data = mmin[start_page:end_page]
+
+                if config['sectors_per_page'] == 4:
+                    sector_data = reverse_bits(page_data[0:0x200])
+                    sector_ecc = reverse_bits(page_data[0x410:0x410 + bch.ecc_bytes])
+                else:
+                    if config['sectors_per_page'] == 2:
+                        sector_data = reverse_bits(page_data[0:0x410])
+                        sector_ecc = reverse_bits(page_data[0x410:0x410 + bch.ecc_bytes])
+                    else:
+                        # get ECC of current sector
+                        start_ecc = config['sectorsize'] + config['metadata_size'] # 512 + 0
+                        end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
+                        sector_ecc = reverse_bits(page_data[start_ecc:end_ecc])
+
+                        #print("ECC0 =", page_data[start_ecc:end_ecc])
+                        #print("reverse ECC0 =", sector_ecc)
+
+                        # get data of current sector
+                        start_data = 0
+                        end_data = start_data + config['sectorsize'] + config['metadata_size']
+                        sector_data = reverse_bits(page_data[start_data:end_data])
+
+                # # calculate ECC
+                # calc_ecc = bch.encode(sector_data)
+
+                # check that data is correct
+                if len(sector_data)*8 > (bch.n - bch.ecc_bits):
+                    print("data len = %i should be <= ecc (n - bits) = %i - %i" % (len(sector_data)*8, bch.n, bch.ecc_bits))
+                if len(sector_ecc) != bch.ecc_bytes:
+                    print("Error: file read ECC len=%i, conf ECC len=%i" % (len(sector_ecc), bch.ecc_bytes))
+                
+                # decrypt sector ECC with xor key
+                decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc1)
+            
+                # apply BCH error correcting code
+                corrected = bch.decode(sector_data, reverse_bits(decrypted_ecc))
+
+                # set expected size for sector
+                expected_size = config['sectorsize'] + config['metadata_size']
+
+                if corrected[0] >= 0 and corrected[0] <= bch.t:
+                    # correctable number of errors
+
+                    if len(corrected[1]) == expected_size:
+                        # write corrected sector data to output file
+                        # skip metadata for first sector in page
+                        fout.write(reverse_bits(corrected[1][config['metadata_size']:]))
+
+                        # increment good sector count
+                        good_sector_count += 1
+
+                        # clear bad sector flag
+                        bad_sector = False
+
+                        # sector had no bit errors
+                        if corrected[0] == 0:
+                            uncorrected_sector_count += 1
+                            # do not change my_page_mark
+                        else:
+                            corrected_sector_count += 1
+                            my_page_mark += 1 # +1 fixed sector at this memory page
+
+                        # early exit if we have a good sector
+                        break
+
+                    else:
+                        print("[-] Error: Corrected data of sector {} has "
+                              "wrong size ({})"
+                              .format(sector, config['sectorsize']))
+                        # set bad sector flag
+                        bad_sector = True
+                        my_page_mark += 0x100 # +100 if size is incorrect
+                else:
+                    # set bad sector flag
+                    bad_sector = True
+                    my_page_mark += 0x10 # +10 if too much errors (more that ECC can correct)
+
+            # check if the sector was corrupted in all input files
+            if bad_sector:
+                # write corrupted sector data to output file
+                fout.write(reverse_bits(corrected[1]))
+
+                # increment bad sector count
+                bad_sector_count += 1
+
+                # print("incorrectable:{} {} {}".format(block, page, sector))
+
+            # process remaining sectors
+            for sector in range(1, sectors_per_page):
+                # initialize bad sector flag
+                bad_sector = False
+
+                # increment count of processed sectors
+                processed_sector_count += 1
+
+                # use all input files, if required (early exit condition)
+                for mmin in input_file_mmaps:
+                    # read page of current memory-map
+                    start_page = start_block + page * config['fullpagesize']
+                    end_page = start_page + config['fullpagesize']
+                    page_data = mmin[start_page:end_page]
+
+                    if config['sectors_per_page'] == 4:
+                        if sector == 1:
+                            sector_data = reverse_bits(page_data[0x200:0x400])
+                            sector_ecc = reverse_bits(page_data[0x417:0x417 + bch.ecc_bytes])
+                        if sector == 2:
+                            sector_data = reverse_bits(page_data[0x400:0x410] + page_data[0x41E:0x60E])
+                            sector_ecc = reverse_bits(page_data[0x810:0x810 + bch.ecc_bytes])
+                        if sector == 3:
+                            sector_data = reverse_bits(page_data[0x60E:0x800] + page_data[0x802:0x810])
+                            sector_ecc = reverse_bits(page_data[0x817:0x817 + bch.ecc_bytes])
+                    else:
+                        if config['sectors_per_page'] == 2:
+                            if sector == 1:
+                                sector_data = reverse_bits(page_data[0x41E:0x800] + page_data[0x802:0x810] + page_data[0x800:0x802] + page_data[0x81E:0x83C])
+                                sector_ecc = reverse_bits(page_data[0x810:0x810 + bch.ecc_bytes])
+                        else:
+                            # get data of current sector
+                            start_data = sector * config['sectorsize'] + config['metadata_size'] + sector * int(config['ecc_bytes_per_sector'])
+                            end_data = start_data + config['sectorsize']
+                            sector_data = reverse_bits(page_data[start_data:end_data])
+
+                            # get ECC of current sector
+                            start_ecc = start_data + config['sectorsize']
+                            end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
+                            sector_ecc = reverse_bits(page_data[start_ecc:end_ecc])
+
+                    # # calculate ECC
+                    # calc_ecc = bch.encode(sector_data)
+
+                    # check that data is correct
+                    if len(sector_data)*8 > (bch.n - bch.ecc_bits):
+                        print("data len = %i should be <= ecc (n - bits) = %i - %i" % (len(sector_data)*8, bch.n, bch.ecc_bits))
+                    if len(sector_ecc) != bch.ecc_bytes:
+                        print("Error: file read ECC len=%i, conf ECC len=%i" % (len(sector_ecc), bch.ecc_bytes))
+                    
+                    # decrypt sector ECC with xor key
+                    decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc2)
+            
+                    # apply BCH error correcting code
+                    corrected = bch.decode(sector_data, reverse_bits(decrypted_ecc))
+
+                    if corrected[0] >= 0 and corrected[0] <= bch.t:
+                        # correctable number of errors
+
+                        if len(corrected[1]) == config['sectorsize']:
+                            # write corrected sector data to output file
+                            fout.write(reverse_bits(corrected[1]))
+
+                            # increment good sector count
+                            good_sector_count += 1
+
+                            # clear bad sector flag
+                            bad_sector = False
+
+                            # sector had no bit errors
+                            if corrected[0] == 0:
+                                uncorrected_sector_count += 1
+                                # do not change my_page_mark
+                            else:
+                                corrected_sector_count += 1
+                                my_page_mark += 1 # +1 fixed sector at this memory page
+
+                            # early exit if we have a good sector
+                            break
+
+                        else:
+                            print("[-] Error: Corrected data of sector {} has "
+                                  "wrong size ({}) but need ({})"
+                                  .format(sector, len(corrected[1]), config['sectorsize']))
+                            # set bad sector flag
+                            bad_sector = True
+                            my_page_mark += 0x100 # +100 if size is incorrect
+                    else:
+                        # set bad sector flag
+                        bad_sector = True
+                        my_page_mark += 0x10 # +10 if too much errors (more that ECC can correct)
+
+                # check if the sector was corrupted in all input files
+                if bad_sector:
+                    # write corrupted sector data to output file
+                    fout.write(reverse_bits(corrected[1]))
+
+                    # increment bad sector count
+                    bad_sector_count += 1
+
+                    # print("incorrectable:{} {} {}".format(block, page, sector))
+
+            # число показывает сколько секторов в странице смогли исправить
+            # если зеленое - то страница вся стала исправленой
+            # если красное - то на странице есть сектора в которых ошибок слишком много и ECC не достаточно для фикса
+            if my_page_mark == 0:
+                if (page+1)%64 == 0:
+                    print("\033[92mG\033[0m")  # no errors page symbol
+                else:
+                    print("\033[92mG\033[0m", end='')
+            else:
+                if my_page_mark < 0x10:
+                    if (page+1)%64 == 0:
+                        print("\033[32m%i\033[0m" % my_page_mark)  # low errors (fixed) page symbol
+                    else:
+                        print("\033[32m%i\033[0m" % my_page_mark, end='')
+                else:
+                    if my_page_mark >= 0x10:
+                        if (page+1)%64 == 0:
+                            print("\033[91m%i\033[0m" % (my_page_mark&0xF))  # too much errors (not fixed) page symbol
+                        else:
+                            print("\033[91m%i\033[0m" % (my_page_mark&0xF), end='')
+                    else:
+                        if my_page_mark >= 0x100:
+                            if (page+1)%64 == 0:
+                                print("\033[31mS\033[0m")  # incorrect size page symbol
+                            else:
+                                print("\033[31mS\033[0m", end='')
+
+            my_page_mark = 0
+
+        # show some statistics during processing all sectors
+        #progress = processed_sector_count / total_sectors * 100
+        #print("\r    Progress: {:.2f}% ({}/{} sectors)"
+        #      .format(progress, processed_sector_count, total_sectors), end="")
+
+    # close output file
+    fout.close()
+
+    # close memory-maps
+    for mm in input_file_mmaps:
+        mm.close()
+
+    # close input files
+    for f in input_file_handles:
+        f.close()
+
+    # show some statistics at the end
+    good_sector_percentage = good_sector_count / total_sectors * 100
+    bad_sector_percentage = bad_sector_count / total_sectors * 100
+    corrected_sector_percentage = corrected_sector_count / total_sectors * 100
+    uncorrected_sector_percentage = uncorrected_sector_count / total_sectors * 100
+    blank_page_percentage = blank_page_count / total_page_count * 100
+    blank_sector_count = blank_page_count * sectors_per_page
+    blank_sector_percentage = blank_sector_count / total_sectors * 100
+    good_data_sector_count = good_sector_count - blank_sector_count
+    good_data_sector_percentage = good_data_sector_count / total_sectors * 100
+    data_sector_count = good_data_sector_count + bad_sector_count
+    data_sector_percentage = data_sector_count / total_sectors * 100
+
+    print("\n[*] Completed error correcting process")
+    print("    Successfully written {} bytes of data to output file '{}'"
+          .format(config['sectorsize'] * total_sectors, outfile))
+    print("    -----\n    Some statistics\n"
+          "    Total pages:        {}\n"
+          "    Blank pages:        {} ({:.2f}%)\n"
+          "    Data pages:         {} ({:.2f}%)\n"
+          "    -----\n    Total sectors:      {}\n"
+          "    Valid sectors:      {} ({:.2f}%)\n"
+          "    Corrupted sectors:  {} ({:.2f}%)\n"
+          "    -----\n    Blank sectors:      {} ({:.2f}%)\n"
+          "    Data sectors:       {} ({:.2f}%)\n"
+          "    -----\n    Valid data sectors: {} ({:.2f}%)\n"
+          "    Corrected sectors:  {} ({:.2f}%)\n"
+          "    No errors sectors:  {} ({:.2f}%)\n"
+          "    Bad marked blocks:  {}\n"
+          "ECC length: {} bytes"
+          .format(total_page_count,
+                  blank_page_count, blank_page_percentage,
+                  total_page_count - blank_page_count, 100 - blank_page_percentage,
+                  total_sectors,
+                  good_sector_count, good_sector_percentage,
+                  bad_sector_count, bad_sector_percentage,
+                  blank_sector_count, blank_sector_percentage,
+                  data_sector_count, data_sector_percentage,
+                  good_data_sector_count, good_data_sector_percentage,
+                  corrected_sector_count, corrected_sector_percentage,
+                  uncorrected_sector_count, uncorrected_sector_percentage,
+                  bad_block_count,
+                  bch.ecc_bytes))
+
+    return
+
+
 def atmel_error_correction(infiles, outfile, config):
     """Do some error correction"""
 
@@ -559,6 +958,8 @@ def nxp_imx28_error_correction(infiles, outfile, config):
     # with open(infile, "rb") as fin:
     print("[*] Starting error correcting process ...")
 
+    print("total_blocks=", block_size_bytes)
+    
     for block in range(total_blocks):
         # read current block data
         start_block = (block + block_offset) * block_size_bytes
@@ -1269,6 +1670,7 @@ def banner():
 # supported vendor specific NAND layout with specific ECC algorithm
 NAND_LAYOUT = {
             "ATMEL": atmel_error_correction,
+            "WINBOND": winbond_error_correction,        # my additions
             "NXP_IMX28": nxp_imx28_error_correction,
             "NXP_P1014": nxp_p1014_error_correction,
             "YAFFS2": yaffs_error_correction            # experimental support
@@ -1285,7 +1687,7 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--infolder', type=str, help='Input folder with binary dump files (.bin)', required=True)
     parser.add_argument('-o', '--outfile', type=str, help='Output dump file', required=True)
     parser.add_argument('-c', '--config', type=str, help='Configuration file')
-    parser.add_argument('-m', '--mode', type=str, help='Vendor specific NAND mode (ATMEL, NXP_IMX28, NXP_P1014, YAFFS2 [experimental])')
+    parser.add_argument('-m', '--mode', type=str, help='Vendor specific NAND mode (ATMEL, WINBOND, NXP_IMX28, NXP_P1014, YAFFS2 [experimental])')
     parser.add_argument('--atmel-config', action="store_true", help='Retrieve ATMEL config from first page of the dump file')
     parser.add_argument('--nxp-fcb-config', action="store_true", help='Retrieve NXP config from firmware control block (FCB) of first page of the dump file')
 
@@ -1372,6 +1774,9 @@ if __name__ == '__main__':
             config = read_nxp_imx28_config(first_page, config)
 
     else:
+        if not args.config:
+            print("[-] Error: need set Config file")
+            sys.exit(1)
         # read configuration from given config file
         if not os.path.isfile(args.config):
             print("[-] Error: Config file '{}' does not exist".format(args.config))
