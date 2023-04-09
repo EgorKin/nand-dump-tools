@@ -162,7 +162,7 @@ def winbond_error_correction(infiles, outfile, config):
     nullbyte_ecc2 = [0x79, 0xE8, 0x94, 0x34, 0xA2, 0xD6, 0xB8, 0x41, 0x11, 0x95, 0x93, 0x4B, 0x6B, 0x5B]
 
     # initialize BCH decoder
-    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'], False)
+    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'])
 
     # open output file
     fout = open(outfile, "wb")
@@ -272,16 +272,16 @@ def winbond_error_correction(infiles, outfile, config):
 
                 if config['sectors_per_page'] == 4:
                     sector_data = reverse_bits(page_data[0:0x200])
-                    sector_ecc = reverse_bits(page_data[0x410:0x410 + bch.ecc_bytes])
+                    sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
                 else:
                     if config['sectors_per_page'] == 2:
                         sector_data = reverse_bits(page_data[0:0x410])
-                        sector_ecc = reverse_bits(page_data[0x410:0x410 + bch.ecc_bytes])
+                        sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
                     else:
                         # get ECC of current sector
                         start_ecc = config['sectorsize'] + config['metadata_size'] # 512 + 0
                         end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
-                        sector_ecc = reverse_bits(page_data[start_ecc:end_ecc])
+                        sector_ecc = (page_data[start_ecc:end_ecc])
 
                         #print("ECC0 =", page_data[start_ecc:end_ecc])
                         #print("reverse ECC0 =", sector_ecc)
@@ -374,18 +374,18 @@ def winbond_error_correction(infiles, outfile, config):
                     if config['sectors_per_page'] == 4:
                         if sector == 1:
                             sector_data = reverse_bits(page_data[0x200:0x400])
-                            sector_ecc = reverse_bits(page_data[0x417:0x417 + bch.ecc_bytes])
+                            sector_ecc = (page_data[0x417:0x417 + bch.ecc_bytes])
                         if sector == 2:
                             sector_data = reverse_bits(page_data[0x400:0x410] + page_data[0x41E:0x60E])
-                            sector_ecc = reverse_bits(page_data[0x810:0x810 + bch.ecc_bytes])
+                            sector_ecc = (page_data[0x810:0x810 + bch.ecc_bytes])
                         if sector == 3:
                             sector_data = reverse_bits(page_data[0x60E:0x800] + page_data[0x802:0x810])
-                            sector_ecc = reverse_bits(page_data[0x817:0x817 + bch.ecc_bytes])
+                            sector_ecc = (page_data[0x817:0x817 + bch.ecc_bytes])
                     else:
                         if config['sectors_per_page'] == 2:
                             if sector == 1:
                                 sector_data = reverse_bits(page_data[0x41E:0x800] + page_data[0x802:0x810] + page_data[0x800:0x802] + page_data[0x81E:0x83C])
-                                sector_ecc = reverse_bits(page_data[0x810:0x810 + bch.ecc_bytes])
+                                sector_ecc = (page_data[0x810:0x810 + bch.ecc_bytes])
                         else:
                             # get data of current sector
                             start_data = sector * config['sectorsize'] + config['metadata_size'] + sector * int(config['ecc_bytes_per_sector'])
@@ -395,7 +395,7 @@ def winbond_error_correction(infiles, outfile, config):
                             # get ECC of current sector
                             start_ecc = start_data + config['sectorsize']
                             end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
-                            sector_ecc = reverse_bits(page_data[start_ecc:end_ecc])
+                            sector_ecc = (page_data[start_ecc:end_ecc])
 
                     # # calculate ECC
                     # calc_ecc = bch.encode(sector_data)
@@ -407,7 +407,7 @@ def winbond_error_correction(infiles, outfile, config):
                         print("Error: file read ECC len=%i, conf ECC len=%i" % (len(sector_ecc), bch.ecc_bytes))
                     
                     # decrypt sector ECC with xor key
-                    decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc2)
+                    decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc1)
             
                     # apply BCH error correcting code
                     corrected = bch.decode(sector_data, reverse_bits(decrypted_ecc))
@@ -417,7 +417,7 @@ def winbond_error_correction(infiles, outfile, config):
 
                         if len(corrected[1]) == config['sectorsize']:
                             # write corrected sector data to output file
-                            fout.write(reverse_bits(corrected[1]))
+                            fout.write(reverse_bits(corrected[1][0:1008]))
 
                             # increment good sector count
                             good_sector_count += 1
@@ -463,9 +463,9 @@ def winbond_error_correction(infiles, outfile, config):
             # если красное - то на странице есть сектора в которых ошибок слишком много и ECC не достаточно для фикса
             if my_page_mark == 0:
                 if (page+1)%64 == 0:
-                    print("\033[92mG\033[0m")  # no errors page symbol
+                    print("\033[92m█\033[0m")  # no errors page symbol
                 else:
-                    print("\033[92mG\033[0m", end='')
+                    print("\033[92m█\033[0m", end='')
             else:
                 if my_page_mark < 0x10:
                     if (page+1)%64 == 0:
