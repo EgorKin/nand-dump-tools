@@ -531,8 +531,7 @@ def winbond_error_correction(infiles, outfile, config):
           "    -----\n    Valid data sectors: {} ({:.2f}%)\n"
           "    Corrected sectors:  {} ({:.2f}%)\n"
           "    No errors sectors:  {} ({:.2f}%)\n"
-          "    Bad marked blocks:  {}\n"
-          "ECC length: {} bytes"
+          "    Bad marked blocks:  {}"
           .format(total_page_count,
                   blank_page_count, blank_page_percentage,
                   total_page_count - blank_page_count, 100 - blank_page_percentage,
@@ -544,8 +543,7 @@ def winbond_error_correction(infiles, outfile, config):
                   good_data_sector_count, good_data_sector_percentage,
                   corrected_sector_count, corrected_sector_percentage,
                   uncorrected_sector_count, uncorrected_sector_percentage,
-                  bad_block_count,
-                  bch.ecc_bytes))
+                  bad_block_count))
 
     return
 
