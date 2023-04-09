@@ -417,7 +417,7 @@ def winbond_error_correction(infiles, outfile, config):
 
                         if len(corrected[1]) == config['sectorsize']:
                             # write corrected sector data to output file
-                            fout.write(reverse_bits(corrected[1][0:1008]))
+                            fout.write(reverse_bits(corrected[1][0:1008])) # пишем только данные без OOB т.е. 994 + 14 байт = 1008
 
                             # increment good sector count
                             good_sector_count += 1
@@ -451,7 +451,7 @@ def winbond_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(reverse_bits(corrected[1]))
+                    fout.write(reverse_bits(corrected[1][0:1008]))
 
                     # increment bad sector count
                     bad_sector_count += 1
