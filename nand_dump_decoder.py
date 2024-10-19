@@ -37,7 +37,7 @@
   SOFTWARE.
 """
 
-__version__ = '0.2.3'
+__version__ = '0.3.0'
 __author__ = 'Matthias Deeg, Moritz Lottermann, Dmitry Egorkin'
 
 import argparse
@@ -153,16 +153,17 @@ def read_atmel_config(page, config):
 
 #my additions
 def winbond_error_correction(infiles, outfile, config):
+    global start_data, sector_data, sector_ecc
     """Do some error correction"""
 
     # ECC1 for blank sector (FF only)
-    nullbyte_ecc1 = [0x0A, 0x3A, 0xE9, 0x39, 0x43, 0xDE, 0x09, 0xAC, 0x83, 0x22, 0xD0, 0xE1, 0x7F, 0xF3]
+    # nullbyte_ecc1 = [0x0A, 0x3A, 0xE9, 0x39, 0x43, 0xDE, 0x09, 0xAC, 0x83, 0x22, 0xD0, 0xE1, 0x7F, 0xF3]
 
     # ECC2 for blank sector (FF only)
-    nullbyte_ecc2 = [0x79, 0xE8, 0x94, 0x34, 0xA2, 0xD6, 0xB8, 0x41, 0x11, 0x95, 0x93, 0x4B, 0x6B, 0x5B]
+    # nullbyte_ecc2 = [0x79, 0xE8, 0x94, 0x34, 0xA2, 0xD6, 0xB8, 0x41, 0x11, 0x95, 0x93, 0x4B, 0x6B, 0x5B]
 
     # initialize BCH decoder
-    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'])
+    bch = bchlib.BCH(config['ecc_errors'], config['ecc_polynom'])
 
     # open output file
     fout = open(outfile, "wb")
@@ -205,6 +206,111 @@ def winbond_error_correction(infiles, outfile, config):
 
     # set current input file memory-map
     mm = input_file_mmaps[input_file_index]
+    
+    
+    # ====== search for XOR key used for "encrypting" ECCs in the spare area
+    '''Вычисленное ECC для страницы полностью из 00 будет тоже = 00 00 00 00...
+       Вычисленное ECC для страницы полностью из FF будет неким числом но в дампах везде FF (так как полностью стертая страница - это FF) и чтобы их движок проверки ECC не метил как с кучей ошибок то делается следующее:
+       Для FF-страницы вычисляется ECC, оно XOR с 0xFF и это будет - базовое число.
+       И затем для каждой страницы вычисленное ECC перед записью в OOB будет XOR с базовой.
+       Т.о. для FF страницы будет ECC XOR базовое = FF FF FF...
+       А у страницы из 00 00 записаный в OOB ECC будет как раз базовым числом (т.к. 00 00... XOR базовое = базовое).'''
+    nullbyte_sector = b'\x00' * config['sectorsize']
+    print("[*] Search for ECC crypto key ...")
+    key_found = False
+    
+    for block in range(total_blocks): # берем каждый блок - от 0 да 1023 включительно
+        # read current block data
+        start_block = (block + block_offset) * block_size_bytes
+        end_block = start_block + block_size_bytes
+        block_data = mm[start_block:end_block]
+
+        # check if page has Bad Block marker != FF FF
+        b1 = block_data[0x800:0x802]
+        if b1 != b'\xff\xff':
+            continue
+
+        # process pages in block
+        for page in range(config['blocksize']): # берем каждую страницу взятого блока - от 0 да 63 включительно
+            start_page = page * config['fullpagesize']
+            end_page = start_page + config['fullpagesize']
+            page_data = block_data[start_page:end_page]
+
+            # check if page is blank (FF FF FF ...)
+            if page_data == blank_page:
+                continue
+            
+            for sector in range(sectors_per_page):
+                # use all input files, if required (early exit condition)
+                for mmin in input_file_mmaps:
+                    # read page of current memory-map
+                    start_page = start_block + page * config['fullpagesize']
+                    end_page = start_page + config['fullpagesize']
+                    page_data = mmin[start_page:end_page]
+
+                    start_data = 0
+                    if config['sectors_per_page'] == 4:
+                        if sector == 0:
+                            sector_data = reverse_bits(page_data[0:0x200])
+                            sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
+                        if sector == 1:
+                            sector_data = reverse_bits(page_data[0x200:0x400])
+                            sector_ecc = (page_data[0x417:0x417 + bch.ecc_bytes])
+                        if sector == 2:
+                            sector_data = reverse_bits(page_data[0x400:0x410] + page_data[0x41E:0x60E])
+                            sector_ecc = (page_data[0x810:0x810 + bch.ecc_bytes])
+                        if sector == 3:
+                            sector_data = reverse_bits(page_data[0x60E:0x800] + page_data[0x802:0x810])
+                            sector_ecc = (page_data[0x817:0x817 + bch.ecc_bytes])
+                    else:
+                        if config['sectors_per_page'] == 2:
+                            if sector == 0:
+                                sector_data = reverse_bits(page_data[0:0x410])
+                                sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
+                            if sector == 1:
+                                sector_data = reverse_bits(page_data[0x41E:0x800] + page_data[0x802:0x810] + page_data[0x800:0x802] + page_data[0x81E:0x83C])
+                                sector_ecc = (page_data[0x810:0x810 + bch.ecc_bytes])
+                        else:
+                            if sector == 0:
+                                # get data of current sector
+                                start_data = 0
+                                end_data = start_data + config['sectorsize'] + config['metadata_size']
+                                sector_data = reverse_bits(page_data[start_data:end_data])
+                                # get ECC of current sector
+                                start_ecc = config['sectorsize'] + config['metadata_size'] # 512 + 0
+                                end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
+                                sector_ecc = (page_data[start_ecc:end_ecc])
+                            else:
+                                # get data of current sector
+                                start_data = sector * config['sectorsize'] + config['metadata_size'] + sector * int(config['ecc_bytes_per_sector'])
+                                end_data = start_data + config['sectorsize']
+                                sector_data = reverse_bits(page_data[start_data:end_data])
+                                # get ECC of current sector
+                                start_ecc = start_data + config['sectorsize']
+                                end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
+                                sector_ecc = (page_data[start_ecc:end_ecc])
+                        
+                    if sector_data == nullbyte_sector:
+                        nullbyte_ecc = sector_ecc
+                        # we have found our xor key, so stop searching
+                        # should be same as nullbyte_ecc1 for W25N01GV flash chip (it was hardcoded early)
+                        print("[*] Found at 0x%08X ECC crypto key: {}".format(nullbyte_ecc.hex()) % (start_block + start_page + start_data))
+                        key_found = True
+                        break
+                # if the XOR key was found, stop searching
+                if key_found:
+                    break
+            # if the XOR key was found, stop searching
+            if key_found:
+                break
+        # if the XOR key was found, stop searching
+            if key_found:
+                break
+    
+    if not key_found:
+        print("[-] Could not find the ECC crypto key. Please use other dump files or fix config")
+        sys.exit(1)
+    # ====== 
 
     # with open(infile, "rb") as fin:
     print("[*] Starting error correcting process ...")
@@ -254,110 +360,8 @@ def winbond_error_correction(infiles, outfile, config):
             # if page not blank start processing sectors in page
             my_page_mark = 0 # no errors at this sector
             
-            
-            # process sector 0 (can be different than remaining sectors
-            # of the current page)
-            sector = 0
-            bad_sector = False
-
-            # increment count of processed sectors
-            processed_sector_count += 1
-
-            # use all input files, if required (early exit condition)
-            for mmin in input_file_mmaps:
-                # read page of current memory-map
-                start_page = start_block + page * config['fullpagesize']
-                end_page = start_page + config['fullpagesize']
-                page_data = mmin[start_page:end_page]
-
-                if config['sectors_per_page'] == 4:
-                    sector_data = reverse_bits(page_data[0:0x200])
-                    sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
-                else:
-                    if config['sectors_per_page'] == 2:
-                        sector_data = reverse_bits(page_data[0:0x410])
-                        sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
-                    else:
-                        # get ECC of current sector
-                        start_ecc = config['sectorsize'] + config['metadata_size'] # 512 + 0
-                        end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
-                        sector_ecc = (page_data[start_ecc:end_ecc])
-
-                        #print("ECC0 =", page_data[start_ecc:end_ecc])
-                        #print("reverse ECC0 =", sector_ecc)
-
-                        # get data of current sector
-                        start_data = 0
-                        end_data = start_data + config['sectorsize'] + config['metadata_size']
-                        sector_data = reverse_bits(page_data[start_data:end_data])
-
-                # # calculate ECC
-                # calc_ecc = bch.encode(sector_data)
-
-                # check that data is correct
-                if len(sector_data)*8 > (bch.n - bch.ecc_bits):
-                    print("data len = %i should be <= ecc (n - bits) = %i - %i" % (len(sector_data)*8, bch.n, bch.ecc_bits))
-                if len(sector_ecc) != bch.ecc_bytes:
-                    print("Error: file read ECC len=%i, conf ECC len=%i" % (len(sector_ecc), bch.ecc_bytes))
-                
-                # decrypt sector ECC with xor key
-                decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc1)
-            
-                # apply BCH error correcting code
-                corrected = bch.decode(sector_data, reverse_bits(decrypted_ecc))
-
-                # set expected size for sector
-                expected_size = config['sectorsize'] + config['metadata_size']
-
-                if corrected[0] >= 0 and corrected[0] <= bch.t:
-                    # correctable number of errors
-
-                    if len(corrected[1]) == expected_size:
-                        # write corrected sector data to output file
-                        # skip metadata for first sector in page
-                        fout.write(reverse_bits(corrected[1][config['metadata_size']:]))
-
-                        # increment good sector count
-                        good_sector_count += 1
-
-                        # clear bad sector flag
-                        bad_sector = False
-
-                        # sector had no bit errors
-                        if corrected[0] == 0:
-                            uncorrected_sector_count += 1
-                            # do not change my_page_mark
-                        else:
-                            corrected_sector_count += 1
-                            my_page_mark += 1 # +1 fixed sector at this memory page
-
-                        # early exit if we have a good sector
-                        break
-
-                    else:
-                        print("[-] Error: Corrected data of sector {} has "
-                              "wrong size ({})"
-                              .format(sector, config['sectorsize']))
-                        # set bad sector flag
-                        bad_sector = True
-                        my_page_mark += 0x100 # +100 if size is incorrect
-                else:
-                    # set bad sector flag
-                    bad_sector = True
-                    my_page_mark += 0x10 # +10 if too much errors (more that ECC can correct)
-
-            # check if the sector was corrupted in all input files
-            if bad_sector:
-                # write corrupted sector data to output file
-                fout.write(reverse_bits(corrected[1]))
-
-                # increment bad sector count
-                bad_sector_count += 1
-
-                # print("incorrectable:{} {} {}".format(block, page, sector))
-
             # process remaining sectors
-            for sector in range(1, sectors_per_page):
+            for sector in range(sectors_per_page):
                 # initialize bad sector flag
                 bad_sector = False
 
@@ -372,6 +376,9 @@ def winbond_error_correction(infiles, outfile, config):
                     page_data = mmin[start_page:end_page]
 
                     if config['sectors_per_page'] == 4:
+                        if sector == 0:
+                            sector_data = reverse_bits(page_data[0:0x200])
+                            sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
                         if sector == 1:
                             sector_data = reverse_bits(page_data[0x200:0x400])
                             sector_ecc = (page_data[0x417:0x417 + bch.ecc_bytes])
@@ -383,19 +390,31 @@ def winbond_error_correction(infiles, outfile, config):
                             sector_ecc = (page_data[0x817:0x817 + bch.ecc_bytes])
                     else:
                         if config['sectors_per_page'] == 2:
+                            if sector == 0:
+                                sector_data = reverse_bits(page_data[0:0x410])
+                                sector_ecc = (page_data[0x410:0x410 + bch.ecc_bytes])
                             if sector == 1:
-                                sector_data = reverse_bits(page_data[0x41E:0x800] + page_data[0x802:0x810] + page_data[0x800:0x802] + page_data[0x81E:0x83C])
+                                sector_data = reverse_bits(page_data[0x41E:0x800] + page_data[0x802:0x810] + page_data[0x800:0x802] + page_data[0x81E:0x83C]) # у второго серктора ЕСС считается также по 1040 байтам хотя нормальных данных тут только 1008, остальное OOB
                                 sector_ecc = (page_data[0x810:0x810 + bch.ecc_bytes])
                         else:
-                            # get data of current sector
-                            start_data = sector * config['sectorsize'] + config['metadata_size'] + sector * int(config['ecc_bytes_per_sector'])
-                            end_data = start_data + config['sectorsize']
-                            sector_data = reverse_bits(page_data[start_data:end_data])
-
-                            # get ECC of current sector
-                            start_ecc = start_data + config['sectorsize']
-                            end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
-                            sector_ecc = (page_data[start_ecc:end_ecc])
+                            if sector == 0:
+                                # get data of current sector
+                                start_data = 0
+                                end_data = start_data + config['sectorsize'] + config['metadata_size']
+                                sector_data = reverse_bits(page_data[start_data:end_data])
+                                # get ECC of current sector
+                                start_ecc = config['sectorsize'] + config['metadata_size'] # 512 + 0
+                                end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
+                                sector_ecc = (page_data[start_ecc:end_ecc])
+                            else:
+                                # get data of current sector
+                                start_data = sector * config['sectorsize'] + config['metadata_size'] + sector * int(config['ecc_bytes_per_sector'])
+                                end_data = start_data + config['sectorsize']
+                                sector_data = reverse_bits(page_data[start_data:end_data])
+                                # get ECC of current sector
+                                start_ecc = start_data + config['sectorsize']
+                                end_ecc = start_ecc + int(config['ecc_bytes_per_sector'])
+                                sector_ecc = (page_data[start_ecc:end_ecc])
 
                     # # calculate ECC
                     # calc_ecc = bch.encode(sector_data)
@@ -407,17 +426,31 @@ def winbond_error_correction(infiles, outfile, config):
                         print("Error: file read ECC len=%i, conf ECC len=%i" % (len(sector_ecc), bch.ecc_bytes))
                     
                     # decrypt sector ECC with xor key
-                    decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc1)
+                    decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc)
             
                     # apply BCH error correcting code
                     corrected = bch.decode(sector_data, reverse_bits(decrypted_ecc))
 
-                    if corrected[0] >= 0 and corrected[0] <= bch.t:
+                    # set expected size for sector
+                    if sector == 0:
+                        expected_size = config['sectorsize'] + config['metadata_size']
+                    else:
+                        expected_size = config['sectorsize']
+
+                    if corrected >= 0 and corrected <= bch.t:
                         # correctable number of errors
 
-                        if len(corrected[1]) == config['sectorsize']:
+                        if len(sector_data) == expected_size:
                             # write corrected sector data to output file
-                            fout.write(reverse_bits(corrected[1][0:1008])) # пишем только данные без OOB т.е. 994 + 14 байт = 1008
+                            if config['sectors_per_page'] == 2:
+                                # skip metadata for first sector in page
+                                if sector == 0:
+                                    fout.write(reverse_bits(sector_data[config['metadata_size']:])) # write 1040 bytes
+                                else:
+                                    fout.write(reverse_bits(sector_data[0:1008])) # пишем только данные без OOB т.е. 994 + 14 байт = 1008
+                            else:
+                                # TODO: need to fix here
+                                fout.write(reverse_bits(sector_data))
 
                             # increment good sector count
                             good_sector_count += 1
@@ -426,7 +459,7 @@ def winbond_error_correction(infiles, outfile, config):
                             bad_sector = False
 
                             # sector had no bit errors
-                            if corrected[0] == 0:
+                            if corrected == 0:
                                 uncorrected_sector_count += 1
                                 # do not change my_page_mark
                             else:
@@ -439,7 +472,7 @@ def winbond_error_correction(infiles, outfile, config):
                         else:
                             print("[-] Error: Corrected data of sector {} has "
                                   "wrong size ({}) but need ({})"
-                                  .format(sector, len(corrected[1]), config['sectorsize']))
+                                  .format(sector, len(sector_data), config['sectorsize']))
                             # set bad sector flag
                             bad_sector = True
                             my_page_mark += 0x100 # +100 if size is incorrect
@@ -451,7 +484,10 @@ def winbond_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(reverse_bits(corrected[1][0:1008]))
+                    if sector == 0:
+                        fout.write(reverse_bits(sector_data))
+                    else:
+                        fout.write(reverse_bits(sector_data[0:1008]))
 
                     # increment bad sector count
                     bad_sector_count += 1
@@ -561,7 +597,7 @@ def atmel2_error_correction(infiles, outfile, config):
     #nullbyte_ecc2 = [0x79, 0xE8, 0x94, 0x34, 0xA2, 0xD6, 0xB8, 0x41, 0x11, 0x95, 0x93, 0x4B, 0x6B, 0x5B]
 
     # initialize BCH decoder
-    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'])
+    bch = bchlib.BCH(config['ecc_errors'], config['ecc_polynom'])
 
     # open output file
     fout = open(outfile, "wb")
@@ -705,18 +741,18 @@ def atmel2_error_correction(infiles, outfile, config):
                         print("Error: file read ECC len=%i, conf ECC len=%i" % (len(sector_ecc), bch.ecc_bytes))
                     
                     # decrypt sector ECC with xor key
-                    # decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc1) - не надо тут это делать т.к. у 000000 данных и ЕСС 00
+                    # decrypted_ecc = xor_crypto(sector_ecc, nullbyte_ecc) - не надо тут это делать т.к. у 000000 данных и ЕСС 00
             
                     # apply BCH error correcting code
                     #corrected = bch.decode(sector_data, reverse_bits(sector_ecc))
                     corrected = bch.decode(sector_data, sector_ecc)
 
-                    if corrected[0] >= 0 and corrected[0] <= bch.t:
+                    if corrected >= 0 and corrected <= bch.t:
                         # correctable number of errors
                         #print('here1')
-                        if len(corrected[1]) == config['sectorsize']:
+                        if len(sector_data) == config['sectorsize']:
                             # write corrected sector data to output file
-                            fout.write(reverse_bits(corrected[1]))
+                            fout.write(reverse_bits(sector_data))
                             #print('here2')
                             # increment good sector count
                             good_sector_count += 1
@@ -725,7 +761,7 @@ def atmel2_error_correction(infiles, outfile, config):
                             bad_sector = False
 
                             # sector had no bit errors
-                            if corrected[0] == 0:
+                            if corrected == 0:
                                 uncorrected_sector_count += 1
                                 #print('here3')
                                 # do not change my_page_mark
@@ -740,7 +776,7 @@ def atmel2_error_correction(infiles, outfile, config):
                         else:
                             print("[-] Error: Corrected data of sector {} has "
                                   "wrong size ({}) but need ({})"
-                                  .format(sector, len(corrected[1]), config['sectorsize']))
+                                  .format(sector, len(sector_data), config['sectorsize']))
                             # set bad sector flag
                             bad_sector = True
                             my_page_mark += 0x100 # +100 if size is incorrect
@@ -753,7 +789,7 @@ def atmel2_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(reverse_bits(corrected[1]))
+                    fout.write(reverse_bits(sector_data))
 
                     # increment bad sector count
                     bad_sector_count += 1
@@ -859,7 +895,7 @@ def atmel_error_correction(infiles, outfile, config):
     """Do some error correction"""
 
     # initialize BCH decoder
-    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'], False)
+    bch = bchlib.BCH(config['ecc_errors'], config['ecc_polynom'])
 
     # open output file
     fout = open(outfile, "wb")
@@ -1052,15 +1088,14 @@ def atmel_error_correction(infiles, outfile, config):
                     decrypted_sector_ecc = xor_crypto(sector_ecc, nullbyte_ecc)
 
                     # apply BCH error correcting code
-                    corrected = bch.decode(sector_data,
-                                           reverse_bits(decrypted_sector_ecc))
+                    corrected = bch.decode(sector_data, reverse_bits(decrypted_sector_ecc))
 
-                    if corrected[0] >= 0 and corrected[0] <= bch.t:
+                    if corrected >= 0 and corrected <= bch.t:
                         # correctable number of errors
 
-                        if len(corrected[1]) == config['sectorsize']:
+                        if len(sector_data) == config['sectorsize']:
                             # write corrected sector data to output file
-                            fout.write(reverse_bits(corrected[1]))
+                            fout.write(reverse_bits(sector_data))
 
                             # increment good sector count
                             good_sector_count += 1
@@ -1069,7 +1104,7 @@ def atmel_error_correction(infiles, outfile, config):
                             bad_sector = False
 
                             # sector had no bit errors
-                            if corrected[0] == 0:
+                            if corrected == 0:
                                 uncorrected_sector_count += 1
                             else:
                                 corrected_sector_count += 1
@@ -1090,7 +1125,7 @@ def atmel_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(reverse_bits(corrected[1]))
+                    fout.write(reverse_bits(sector_data))
 
                     # increment bad sector count
                     bad_sector_count += 1
@@ -1218,7 +1253,7 @@ def nxp_imx28_error_correction(infiles, outfile, config):
     """Do some error correction"""
 
     # initialize BCH decoder
-    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'], False)
+    bch = bchlib.BCH(config['ecc_errors'], config['ecc_polynom'])
 
     # open output file
     fout = open(outfile, "wb")
@@ -1340,13 +1375,13 @@ def nxp_imx28_error_correction(infiles, outfile, config):
                 # set expected size for sector 0
                 expected_size = config['sectorsize'] + config['metadata_size']
 
-                if corrected[0] >= 0 and corrected[0] <= bch.t:
+                if corrected >= 0 and corrected <= bch.t:
                     # correctable number of errors
 
-                    if len(corrected[1]) == expected_size:
+                    if len(sector_data) == expected_size:
                         # write corrected sector data to output file
                         # skip metadata for first sector in page
-                        fout.write(reverse_bits(corrected[1][config['metadata_size']:]))
+                        fout.write(reverse_bits(sector_data[config['metadata_size']:]))
 
                         # increment good sector count
                         good_sector_count += 1
@@ -1355,7 +1390,7 @@ def nxp_imx28_error_correction(infiles, outfile, config):
                         bad_sector = False
 
                         # sector had no bit errors
-                        if corrected[0] == 0:
+                        if corrected == 0:
                             uncorrected_sector_count += 1
                         else:
                             corrected_sector_count += 1
@@ -1376,7 +1411,7 @@ def nxp_imx28_error_correction(infiles, outfile, config):
             # check if the sector was corrupted in all input files
             if bad_sector:
                 # write corrupted sector data to output file
-                fout.write(reverse_bits(corrected[1]))
+                fout.write(reverse_bits(sector_data))
 
                 # increment bad sector count
                 bad_sector_count += 1
@@ -1416,12 +1451,12 @@ def nxp_imx28_error_correction(infiles, outfile, config):
                     # apply BCH error correcting code
                     corrected = bch.decode(sector_data, sector_ecc)
 
-                    if corrected[0] >= 0 and corrected[0] <= bch.t:
+                    if corrected >= 0 and corrected <= bch.t:
                         # correctable number of errors
 
-                        if len(corrected[1]) == config['sectorsize']:
+                        if len(sector_data) == config['sectorsize']:
                             # write corrected sector data to output file
-                            fout.write(reverse_bits(corrected[1]))
+                            fout.write(reverse_bits(sector_data))
 
                             # increment good sector count
                             good_sector_count += 1
@@ -1430,7 +1465,7 @@ def nxp_imx28_error_correction(infiles, outfile, config):
                             bad_sector = False
 
                             # sector had no bit errors
-                            if corrected[0] == 0:
+                            if corrected == 0:
                                 uncorrected_sector_count += 1
                             else:
                                 corrected_sector_count += 1
@@ -1451,7 +1486,7 @@ def nxp_imx28_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(reverse_bits(corrected[1]))
+                    fout.write(reverse_bits(sector_data))
 
                     # increment bad sector count
                     bad_sector_count += 1
@@ -1516,7 +1551,7 @@ def nxp_p1014_error_correction(infiles, outfile, config):
     """Do some error correction"""
 
     # initialize BCH decoder
-    bch = bchlib.BCH(config['ecc_polynom'], config['ecc_errors'], False)
+    bch = bchlib.BCH(config['ecc_errors'], config['ecc_polynom'])
 
     # open output file
     fout = open(outfile, "wb")
@@ -1623,15 +1658,14 @@ def nxp_p1014_error_correction(infiles, outfile, config):
                     # calc_ecc = reverse_bits(bch.encode(sector_data))
 
                     # apply BCH error correcting code
-                    #print(len(sector_ecc))
                     corrected = bch.decode(sector_data, sector_ecc)
-                    #print(corrected[0])
-                    if corrected[0] >= 0 and corrected[0] <= bch.t:
+
+                    if corrected >= 0 and corrected <= bch.t:
                         # correctable number of errors
 
-                        if len(corrected[1]) == config['sectorsize']:
+                        if len(sector_data) == config['sectorsize']:
                             # write corrected sector data to output file
-                            fout.write(corrected[1])
+                            fout.write(sector_data)
 
                             # increment good sector count
                             good_sector_count += 1
@@ -1640,7 +1674,7 @@ def nxp_p1014_error_correction(infiles, outfile, config):
                             bad_sector = False
 
                             # sector had no bit errors
-                            if corrected[0] == 0:
+                            if corrected == 0:
                                 uncorrected_sector_count += 1
                             else:
                                 corrected_sector_count += 1
@@ -1661,7 +1695,7 @@ def nxp_p1014_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(reverse_bits(corrected[1]))
+                    fout.write(reverse_bits(sector_data))
 
                     # increment bad sector count
                     bad_sector_count += 1
@@ -1837,12 +1871,12 @@ def yaffs_error_correction(infiles, outfile, config):
                     test_ecc = yaffs_calc_ecc_256(sector_data)
                     corrected = yaffs_ecc_correct(sector_data, read_ecc[sector], test_ecc)
 
-                    if corrected[0] == 1:
+                    if corrected == 1:
                         # correctable single bit error
                         corrected_sector_count += 1
 
                         # write corrected sector data to output file
-                        fout.write(bytes(corrected[1]))
+                        fout.write(bytes(sector_data))
 
                         # increment good sector count
                         good_sector_count += 1
@@ -1853,9 +1887,9 @@ def yaffs_error_correction(infiles, outfile, config):
                         # early exit if we have a good sector
                         break
 
-                    elif corrected[0] == 0:
+                    elif corrected == 0:
                         # write corrected sector data to output file
-                        fout.write(bytes(corrected[1]))
+                        fout.write(bytes(sector_data))
 
                         # increment good sector count
                         good_sector_count += 1
@@ -1876,7 +1910,7 @@ def yaffs_error_correction(infiles, outfile, config):
                 # check if the sector was corrupted in all input files
                 if bad_sector:
                     # write corrupted sector data to output file
-                    fout.write(corrected[1])
+                    fout.write(sector_data)
 
                     # increment bad sector count
                     bad_sector_count += 1
