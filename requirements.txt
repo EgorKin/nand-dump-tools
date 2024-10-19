@@ -1,1 +1,1 @@
-bchlib==0.7
+bchlib>=1.0
